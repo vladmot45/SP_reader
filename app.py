@@ -250,7 +250,7 @@ out = out[[c for c in FINAL_ORDER if c in out.columns]]
 
 
 
-    csv_bytes = out.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    csv_bytes = out.to_csv(index=False).encode("utf-8-sig")
     meta = {
         "header_row": header_row,
         "month_cols_detected": [str(k) for k in month_cols.keys()],
