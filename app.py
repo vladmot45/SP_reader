@@ -19,12 +19,14 @@ BASE_COLS = {
     "Uwagi": "Uwagi",
     "UWAGI": "Uwagi",
     "Currency": "Currency",
+    "Transport type": "Transport type",
+    "Country": "Country"
 }
 
 HEADER_MARKERS = ["Contract", "Buyer", "Goods", "Price"]
 
 FINAL_ORDER = [
-    "Date", "Contract", "Buyer", "Protein", "Goods sold", "Contract status",
+    "Date", "Contract", "Transport type", "Country", "Buyer", "Protein", "Goods sold", "Contract status",
     "Delivery month", "Tonnes", "Price FCA", "Price Dap", "Currency", "Uwagi"
 ]
 
@@ -154,6 +156,19 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
 
     base_df = data_df.rename(columns=resolved)
 
+    # Default Transport type
+    if "Transport type" in base_df.columns:
+        base_df["Transport type"] = (
+            base_df["Transport type"]
+            .astype(str)
+            .str.strip()
+            .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+            .fillna("Trucks")
+        )
+    else:
+    # If the column doesn't exist at all, create it
+         base_df["Transport type"] = "Trucks"
+
     if "Contract" in base_df.columns:
         base_df = base_df[base_df["Contract"].notna()]
         base_df = base_df[~base_df["Contract"].astype(str).str.lower().str.contains("total", na=False)]
@@ -185,9 +200,22 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
     if "Uwagi" in long_df.columns:
         long_df["Uwagi"] = long_df["Uwagi"].fillna("N/A")
 
-    key_cols = [c for c in FINAL_ORDER if c in long_df.columns and c != "Tonnes"]
-    out = long_df.groupby(key_cols, as_index=False)["Tonnes"].max()
+    def first_non_empty(s):
+        s = s.dropna().astype(str)
+        s = s[s.str.strip() != ""]
+        return s.iloc[0] if len(s) else pd.NA
+
+    group_keys = [c for c in ["Contract", "Delivery month"] if c in long_df.columns]
+
+    agg = {"Tonnes": "max"}
+    for col in ["Date", "Transport type", "Country", "Buyer", "Protein", "Goods sold",
+                "Contract status", "Price FCA", "Price Dap", "Currency", "Uwagi"]:
+        if col in long_df.columns:
+         agg[col] = first_non_empty
+
+    out = long_df.groupby(group_keys, as_index=False).agg(agg)
     out = out[[c for c in FINAL_ORDER if c in out.columns]]
+
 
     csv_bytes = out.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     meta = {
@@ -198,9 +226,9 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
     return csv_bytes, meta
 
 
-st.title("Excel → CSV converter")
+st.title("SP → CSV Pivotable data converter")
 
-uploaded = st.file_uploader("Upload Excel (.xlsx/.xlsm/.xls)", type=["xlsx", "xlsm", "xls"])
+uploaded = st.file_uploader("Upload ONLY the SP tab (.xlsx/.xlsm/.xls)", type=["xlsx", "xlsm", "xls"])
 if uploaded:
     try:
         csv_bytes, meta = transform_excel_to_csv_bytes(uploaded)
@@ -209,11 +237,16 @@ if uploaded:
         st.caption(f"Month columns detected: {', '.join(meta['month_cols_detected'][:10])}"
                    + (" ..." if len(meta['month_cols_detected']) > 10 else ""))
 
+        from pathlib import Path
+
+        output_name = Path(uploaded.name).stem + "_output.csv"
+
         st.download_button(
             "Download CSV",
             data=csv_bytes,
-            file_name="output.csv",
+            file_name=output_name,
             mime="text/csv",
         )
+
     except Exception as e:
         st.error(str(e))
