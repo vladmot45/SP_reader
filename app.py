@@ -1,8 +1,8 @@
 import re
 from datetime import datetime
+import io
 import pandas as pd
 import streamlit as st
-import io
 
 
 BASE_COLS = {
@@ -21,14 +21,14 @@ BASE_COLS = {
     "UWAGI": "Uwagi",
     "Currency": "Currency",
     "Transport type": "Transport type",
-    "Country": "Country"
+    "Country": "Country",
 }
 
 HEADER_MARKERS = ["Contract", "Buyer", "Goods", "Price"]
 
 FINAL_ORDER = [
-    "Date", "Contract", "Transport type", "Country", "Buyer", "Protein", "Goods sold", "Contract status",
-    "Delivery month", "Tonnes", "Price FCA", "Price Dap", "Currency", "Uwagi"
+    "Date", "Contract", "Transport type", "Country", "Buyer","Buyer abbreviation", "Protein", "Goods sold", "Contract status",
+    "Delivery month", "Tonnes", "Price FCA", "Price Dap", "Currency", "Uwagi",
 ]
 
 
@@ -103,9 +103,9 @@ def build_columns_from_two_rows(raw: pd.DataFrame, header_row: int):
     for t, b in zip(top, bottom):
         dt = to_dt_if_possible(t)
         if dt is not None and dt.day == 1:
-            cols.append(dt)          # keep month headers as datetime
+            cols.append(dt)          # month headers
         else:
-            cols.append(norm(b))     # base headers like Contract, Buyer
+            cols.append(norm(b))     # base headers
     return cols
 
 
@@ -116,7 +116,6 @@ def detect_month_columns(columns):
         if "total" in low or "sum" in low or "razem" in low:
             continue
 
-        # parse header into datetime
         dt = None
         if isinstance(col, (pd.Timestamp, datetime)):
             dt = pd.to_datetime(col)
@@ -126,17 +125,29 @@ def detect_month_columns(columns):
             except Exception:
                 continue
 
-        # IMPORTANT: only keep month headers (must be 1st of month)
+        # only month headers: 1st of month
         if dt.day != 1:
             continue
 
-        month_cols[col] = dt.strftime("%b %y")  # e.g. Mar 27
+        # normalize to first-of-month (00:00)
+        month_cols[col] = pd.Timestamp(dt.year, dt.month, 1)
 
     return month_cols
 
 
+def first_non_empty_str(s: pd.Series):
+    s = s.dropna().astype(str)
+    s = s[s.str.strip() != ""]
+    return s.iloc[0] if len(s) else pd.NA
 
-def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
+
+def first_valid_datetime(s: pd.Series):
+    s = pd.to_datetime(s, errors="coerce")
+    s = s.dropna()
+    return s.iloc[0] if len(s) else pd.NaT
+
+
+def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
     raw_preview = pd.read_excel(file_obj, sheet_name=0, header=None, nrows=400, engine="openpyxl")
     header_row = find_header_row(raw_preview)
 
@@ -162,27 +173,39 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
             resolved[real_col] = out_label
 
     base_df = data_df.rename(columns=resolved)
-    # ---- DATE CLEANING: DROP rows where Date is blank/invalid; format DD/MM/YYYY ----
+
+                # ---- Buyer abbreviation: extract text inside parentheses ----
+    if "Buyer" in base_df.columns:
+        def extract_abbr(x):
+            if pd.isna(x):
+                return pd.NA
+            s = str(x)
+            m = re.search(r"\(([^)]+)\)", s)
+            if m:
+                return m.group(1).strip()
+            return pd.NA
+
+        base_df.insert(
+            base_df.columns.get_loc("Buyer") + 1,
+            "Buyer abbreviation",
+            base_df["Buyer"].apply(extract_abbr)
+        )
+
+    # ---- DATE CLEANING: drop invalid/blanks and KEEP datetime (Excel numeric) ----
     if "Date" in base_df.columns:
         s = (
             base_df["Date"]
             .astype(str)
-            .str.replace("\u00A0", " ", regex=False)  # non-breaking spaces
+            .str.replace("\u00A0", " ", regex=False)
             .str.strip()
-         .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "none": pd.NA, "null": pd.NA})
+            .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "none": pd.NA, "null": pd.NA})
         )
-
         parsed = pd.to_datetime(s, dayfirst=True, errors="coerce")
-
-     # DROP rows with invalid dates (e.g. "hg")
         base_df = base_df.loc[parsed.notna()].copy()
-
-    # Format valid dates
-        base_df["Date"] = parsed.loc[parsed.notna()].dt.strftime("%d/%m/%Y")
+        base_df["Date"] = parsed.loc[parsed.notna()]  # keep datetime
     else:
-    # If Date column doesn't exist, drop everything (since you require a date)
+        # you said: if no valid date, ignore row => if Date column missing, output nothing
         base_df = base_df.iloc[0:0].copy()
-
 
     # Default / create Transport type
     if "Transport type" in base_df.columns:
@@ -196,7 +219,7 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
     else:
         base_df["Transport type"] = "Trucks"
 
-    # Filter out totals etc.
+    # Contract: blank -> N/A, and remove totals
     if "Contract" in base_df.columns:
         base_df["Contract"] = (
             base_df["Contract"]
@@ -205,10 +228,7 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
             .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
             .fillna("N/A")
         )
-
-    # remove totals
-    base_df = base_df[~base_df["Contract"].str.lower().str.contains("total", na=False)]
-
+        base_df = base_df[~base_df["Contract"].str.lower().str.contains("total", na=False)]
 
     # Detect month columns
     month_cols = detect_month_columns(data_df.columns)
@@ -227,8 +247,9 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
         closed_no_months = base_df[is_closed & (month_sum == 0)].copy()
         if not closed_no_months.empty:
             closed_rows = closed_no_months.copy()
-            closed_rows["Delivery month"] = "N/A"
+            closed_rows["Delivery month"] = pd.NaT
             closed_rows["Tonnes"] = 0
+
 
     # Melt to long format
     id_vars = [c for c in FINAL_ORDER if c in base_df.columns and c not in ("Delivery month", "Tonnes")]
@@ -240,7 +261,7 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
         value_name="Tonnes",
     )
 
-    long_df["Delivery month"] = long_df["Delivery month"].map(month_cols)  # "Apr 2026"
+    long_df["Delivery month"] = long_df["Delivery month"].map(month_cols)  # "Mar 27"
     long_df["Tonnes"] = long_df["Tonnes"].apply(clean_number)
     long_df = long_df.dropna(subset=["Tonnes"])
     long_df = long_df[long_df["Tonnes"] != 0]
@@ -249,25 +270,22 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
         if col in long_df.columns:
             long_df[col] = long_df[col].apply(clean_number)
 
-
-
     if "Uwagi" in long_df.columns:
         long_df["Uwagi"] = long_df["Uwagi"].fillna("N/A")
-
-    def first_non_empty(s):
-        s = s.dropna().astype(str)
-        s = s[s.str.strip() != ""]
-        return s.iloc[0] if len(s) else pd.NA
 
     group_keys = [c for c in ["Contract", "Delivery month"] if c in long_df.columns]
     if not group_keys:
         raise ValueError("Cannot group output because Contract/Delivery month columns are missing after transform.")
 
+    # Aggregation: Date must stay datetime; other fields as strings
     agg = {"Tonnes": "max"}
-    for col in ["Date", "Transport type", "Country", "Buyer", "Protein", "Goods sold",
+    if "Date" in long_df.columns:
+        agg["Date"] = first_valid_datetime
+
+    for col in ["Transport type", "Country", "Buyer", "Buyer abbreviation", "Protein", "Goods sold",
                 "Contract status", "Price FCA", "Price Dap", "Currency", "Uwagi"]:
         if col in long_df.columns:
-            agg[col] = first_non_empty
+            agg[col] = first_non_empty_str
 
     out = long_df.groupby(group_keys, as_index=False).agg(agg)
 
@@ -275,19 +293,12 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
     if "Goods sold" in out.columns and "Contract" in out.columns:
         out["Goods sold"] = out["Goods sold"].apply(clean_number).fillna(0)
 
-        if "Delivery month" in out.columns:
-            out["_dm_sort"] = pd.to_datetime(
-                "01-" + out["Delivery month"].astype(str),
-                format="%d-%b %Y",      # FIXED for "01-Apr 2026"
-                errors="coerce"
-            )
-            out = out.sort_values(["Contract", "_dm_sort"], na_position="last")
+    if "Delivery month" in out.columns:
+        out = out.sort_values(["Contract", "Delivery month"], na_position="last")
 
-        first_mask = ~out.duplicated(subset=["Contract"])
-        out.loc[~first_mask, "Goods sold"] = 0
+    first_mask = ~out.duplicated(subset=["Contract"])
+    out.loc[~first_mask, "Goods sold"] = 0
 
-        if "_dm_sort" in out.columns:
-            out = out.drop(columns=["_dm_sort"])
 
     # Append closed contracts that have no monthly tonnes
     if not closed_rows.empty:
@@ -300,12 +311,28 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
     # Final column order
     out = out[[c for c in FINAL_ORDER if c in out.columns]]
 
+    # ---- WRITE XLSX (no locale separator issues), keep Date as numeric with display format ----
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         out.to_excel(writer, index=False, sheet_name="Output")
+        ws = writer.sheets["Output"]
+
+        if "Date" in out.columns:
+            date_col_idx = out.columns.get_loc("Date") + 1  # Excel is 1-based
+            for r in range(2, ws.max_row + 1):
+                cell = ws.cell(row=r, column=date_col_idx)
+                if isinstance(cell.value, (datetime, pd.Timestamp)):
+                    cell.number_format = "DD/MM/YYYY"
+            # Format Delivery month as "Apr 26" but keep it numeric
+        if "Delivery month" in out.columns:
+            dm_col_idx = out.columns.get_loc("Delivery month") + 1
+            for r in range(2, ws.max_row + 1):
+                cell = ws.cell(row=r, column=dm_col_idx)
+                if isinstance(cell.value, (datetime, pd.Timestamp)):
+                    cell.number_format = "mmm yy"
+
 
     xlsx_bytes = buffer.getvalue()
-
 
     meta = {
         "header_row": header_row,
@@ -315,25 +342,26 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
     return xlsx_bytes, meta
 
 
-
-st.title("SP → CSV Pivotable data converter")
+st.title("SP → Pivotable data converter (XLSX output)")
 
 uploaded = st.file_uploader("Upload ONLY the SP tab (.xlsx/.xlsm/.xls)", type=["xlsx", "xlsm", "xls"])
 if uploaded:
     try:
-        csv_bytes, meta = transform_excel_to_csv_bytes(uploaded)
+        xlsx_bytes, meta = transform_excel_to_xlsx_bytes(uploaded)
+
         st.success(f"Done. Output rows: {meta['rows_out']}")
         st.caption(f"Header row used: {meta['header_row']}")
-        st.caption(f"Month columns detected: {', '.join(meta['month_cols_detected'][:10])}"
-                   + (" ..." if len(meta['month_cols_detected']) > 10 else ""))
+        st.caption(
+            f"Month columns detected: {', '.join(meta['month_cols_detected'][:10])}"
+            + (" ..." if len(meta['month_cols_detected']) > 10 else "")
+        )
 
         from pathlib import Path
-
         output_name = Path(uploaded.name).stem + "_output.xlsx"
 
         st.download_button(
-            "Download CSV",
-            data=csv_bytes,
+            "Download Excel",
+            data=xlsx_bytes,
             file_name=output_name,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
