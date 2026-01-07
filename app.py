@@ -2,6 +2,7 @@ import re
 from datetime import datetime
 import pandas as pd
 import streamlit as st
+import io
 
 
 BASE_COLS = {
@@ -299,14 +300,19 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
     # Final column order
     out = out[[c for c in FINAL_ORDER if c in out.columns]]
 
-    csv_bytes = out.to_csv(index=False).encode("utf-8-sig")
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        out.to_excel(writer, index=False, sheet_name="Output")
+
+    xlsx_bytes = buffer.getvalue()
+
 
     meta = {
         "header_row": header_row,
         "month_cols_detected": [str(k) for k in month_cols.keys()],
         "rows_out": int(out.shape[0]),
     }
-    return csv_bytes, meta
+    return xlsx_bytes, meta
 
 
 
@@ -323,13 +329,13 @@ if uploaded:
 
         from pathlib import Path
 
-        output_name = Path(uploaded.name).stem + "_output.csv"
+        output_name = Path(uploaded.name).stem + "_output.xlsx"
 
         st.download_button(
             "Download CSV",
             data=csv_bytes,
             file_name=output_name,
-            mime="text/csv",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
     except Exception as e:
