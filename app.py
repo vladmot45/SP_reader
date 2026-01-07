@@ -176,6 +176,32 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
     month_cols = detect_month_columns(data_df.columns)
     if not month_cols:
         raise ValueError("No month columns found. Month headers must be dates (1st of month).")
+        # --- CLOSED contracts without any monthly tonnes ---
+    closed_rows = pd.DataFrame()
+
+    if "Contract status" in base_df.columns and "Contract" in base_df.columns:
+        status = base_df["Contract status"].astype(str).str.lower().str.strip()
+        is_closed = status.eq("closed")
+
+    # Sum of month columns (treat blanks as 0)
+        month_sum = (
+            base_df[list(month_cols.keys())]
+            .applymap(clean_number)
+            .fillna(0)
+            .sum(axis=1)
+        )
+
+    # closed + no deliveries in any month column
+        closed_no_months = base_df[is_closed & (month_sum == 0)].copy()
+
+        if not closed_no_months.empty:
+            closed_rows = closed_no_months.copy()
+            closed_rows["Delivery month"] = "N/A"
+            closed_rows["Tonnes"] = 0
+            # keep only columns that exist
+            keep = [c for c in FINAL_ORDER if c in closed_rows.columns] + ["Delivery month", "Tonnes"]
+            closed_rows = closed_rows[[c for c in keep if c in closed_rows.columns]]
+
 
     id_vars = [c for c in FINAL_ORDER if c in base_df.columns and c not in ("Delivery month", "Tonnes")]
     long_df = base_df.melt(
@@ -215,6 +241,13 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
 
     out = long_df.groupby(group_keys, as_index=False).agg(agg)
     out = out[[c for c in FINAL_ORDER if c in out.columns]]
+# Append closed contracts that have no monthly tonnes
+    if not closed_rows.empty:
+        out = pd.concat([out, closed_rows], ignore_index=True, sort=False)
+
+# Final column order (again, because concat can reorder)
+out = out[[c for c in FINAL_ORDER if c in out.columns]]
+
 
 
     csv_bytes = out.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
