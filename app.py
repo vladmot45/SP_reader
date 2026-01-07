@@ -115,6 +115,7 @@ def detect_month_columns(columns):
         if "total" in low or "sum" in low or "razem" in low:
             continue
 
+        # parse header into datetime
         dt = None
         if isinstance(col, (pd.Timestamp, datetime)):
             dt = pd.to_datetime(col)
@@ -124,8 +125,14 @@ def detect_month_columns(columns):
             except Exception:
                 continue
 
-        month_cols[col] = dt.strftime("%b %Y")  # e.g. Apr 2026
+        # IMPORTANT: only keep month headers (must be 1st of month)
+        if dt.day != 1:
+            continue
+
+        month_cols[col] = dt.strftime("%b %y")  # e.g. Mar 27
+
     return month_cols
+
 
 
 def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
@@ -154,6 +161,27 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
             resolved[real_col] = out_label
 
     base_df = data_df.rename(columns=resolved)
+    # ---- DATE CLEANING: DROP rows where Date is blank/invalid; format DD/MM/YYYY ----
+    if "Date" in base_df.columns:
+        s = (
+            base_df["Date"]
+            .astype(str)
+            .str.replace("\u00A0", " ", regex=False)  # non-breaking spaces
+            .str.strip()
+         .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "none": pd.NA, "null": pd.NA})
+        )
+
+        parsed = pd.to_datetime(s, dayfirst=True, errors="coerce")
+
+     # DROP rows with invalid dates (e.g. "hg")
+        base_df = base_df.loc[parsed.notna()].copy()
+
+    # Format valid dates
+        base_df["Date"] = parsed.loc[parsed.notna()].dt.strftime("%d/%m/%Y")
+    else:
+    # If Date column doesn't exist, drop everything (since you require a date)
+        base_df = base_df.iloc[0:0].copy()
+
 
     # Default / create Transport type
     if "Transport type" in base_df.columns:
@@ -169,8 +197,17 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
 
     # Filter out totals etc.
     if "Contract" in base_df.columns:
-        base_df = base_df[base_df["Contract"].notna()]
-        base_df = base_df[~base_df["Contract"].astype(str).str.lower().str.contains("total", na=False)]
+        base_df["Contract"] = (
+            base_df["Contract"]
+            .astype(str)
+            .str.strip()
+            .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+            .fillna("N/A")
+        )
+
+    # remove totals
+    base_df = base_df[~base_df["Contract"].str.lower().str.contains("total", na=False)]
+
 
     # Detect month columns
     month_cols = detect_month_columns(data_df.columns)
@@ -211,8 +248,7 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
         if col in long_df.columns:
             long_df[col] = long_df[col].apply(clean_number)
 
-    if "Date" in long_df.columns:
-        long_df["Date"] = pd.to_datetime(long_df["Date"], errors="coerce").dt.strftime("%d.%m.%Y")
+
 
     if "Uwagi" in long_df.columns:
         long_df["Uwagi"] = long_df["Uwagi"].fillna("N/A")
