@@ -156,7 +156,7 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
 
     base_df = data_df.rename(columns=resolved)
 
-    # Default Transport type
+    # Default / create Transport type
     if "Transport type" in base_df.columns:
         base_df["Transport type"] = (
             base_df["Transport type"]
@@ -166,13 +166,14 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
             .fillna("Trucks")
         )
     else:
-    # If the column doesn't exist at all, create it
-         base_df["Transport type"] = "Trucks"
+        base_df["Transport type"] = "Trucks"
 
+    # Filter out totals etc.
     if "Contract" in base_df.columns:
         base_df = base_df[base_df["Contract"].notna()]
         base_df = base_df[~base_df["Contract"].astype(str).str.lower().str.contains("total", na=False)]
 
+    # Detect month columns
     month_cols = detect_month_columns(data_df.columns)
     if not month_cols:
         raise ValueError("No month columns found. Month headers must be dates (1st of month).")
@@ -203,7 +204,23 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
             closed_rows = closed_rows[[c for c in keep if c in closed_rows.columns]]
 
 
+    # --- CLOSED contracts without any monthly tonnes ---
+    closed_rows = pd.DataFrame()
+    if "Contract status" in base_df.columns and "Contract" in base_df.columns:
+        status = base_df["Contract status"].astype(str).str.lower().str.strip()
+        is_closed = status.eq("closed")
+
+        month_block = base_df[list(month_cols.keys())].apply(lambda col: col.map(clean_number))
+        month_sum = month_block.fillna(0).sum(axis=1)
+
+        closed_no_months = base_df[is_closed & (month_sum == 0)].copy()
+        if not closed_no_months.empty:
+            closed_rows = closed_no_months.copy()
+            closed_rows["Delivery month"] = "N/A"
+            closed_rows["Tonnes"] = 0
+
     id_vars = [c for c in FINAL_ORDER if c in base_df.columns and c not in ("Delivery month", "Tonnes")]
+
     long_df = base_df.melt(
         id_vars=id_vars,
         value_vars=list(month_cols.keys()),
@@ -232,14 +249,50 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
         return s.iloc[0] if len(s) else pd.NA
 
     group_keys = [c for c in ["Contract", "Delivery month"] if c in long_df.columns]
+    if not group_keys:
+        raise ValueError("Cannot group output because Contract/Delivery month columns are missing after transform.")
 
     agg = {"Tonnes": "max"}
     for col in ["Date", "Transport type", "Country", "Buyer", "Protein", "Goods sold",
                 "Contract status", "Price FCA", "Price Dap", "Currency", "Uwagi"]:
         if col in long_df.columns:
-         agg[col] = first_non_empty
+            agg[col] = first_non_empty
 
     out = long_df.groupby(group_keys, as_index=False).agg(agg)
+    # --- Show "Goods sold" only once per Contract (0 for other months) ---
+    if "Goods sold" in out.columns and "Contract" in out.columns:
+        # make sure numeric
+        out["Goods sold"] = out["Goods sold"].apply(clean_number).fillna(0)
+
+    # sort so the "first" row per contract is deterministic:
+    # put earliest delivery month first (works with your "Jan-29" style)
+        if "Delivery month" in out.columns:
+            try:
+                out["_dm_sort"] = pd.to_datetime("01-" + out["Delivery month"].astype(str), format="%d-%b-%y", errors="coerce")
+                out = out.sort_values(["Contract", "_dm_sort"], na_position="last")
+            except Exception:
+                out = out.sort_values(["Contract"])
+
+        # keep goods sold only on the first row per contract
+        first_mask = ~out.duplicated(subset=["Contract"])
+        out.loc[~first_mask, "Goods sold"] = 0
+
+        # cleanup
+        if "_dm_sort" in out.columns:
+            out = out.drop(columns=["_dm_sort"])
+
+    
+
+    # Append closed contracts that have no monthly tonnes
+    if not closed_rows.empty:
+        # align columns
+        for c in out.columns:
+            if c not in closed_rows.columns:
+                closed_rows[c] = pd.NA
+        closed_rows = closed_rows[out.columns]
+        out = pd.concat([out, closed_rows], ignore_index=True, sort=False)
+
+    # Final column order
     out = out[[c for c in FINAL_ORDER if c in out.columns]]
 # Append closed contracts that have no monthly tonnes
     if not closed_rows.empty:
@@ -248,8 +301,11 @@ def transform_excel_to_csv_bytes(file_obj) -> tuple[bytes, dict]:
 # Final column order (again, because concat can reorder)
 out = out[[c for c in FINAL_ORDER if c in out.columns]]
 
+<<<<<<< HEAD
 
 
+=======
+>>>>>>> 5e24419 (Fix Goods sold duplication)
     csv_bytes = out.to_csv(index=False).encode("utf-8-sig")
     meta = {
         "header_row": header_row,
