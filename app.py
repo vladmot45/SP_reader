@@ -544,7 +544,7 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
 
 st.title("SP → Pivotable data converter (XLSX output)")
 
-uploaded = st.file_uploader("Upload ONLY the SP tab (.xlsx/.xlsm/.xls)", type=["xlsx", "xlsm", "xls"])
+uploaded = st.file_uploader("Upload SP file (.xlsx/.xlsm/.xls)", type=["xlsx", "xlsm", "xls"])
 if uploaded:
     try:
         xlsx_bytes, meta = transform_excel_to_xlsx_bytes(uploaded)
