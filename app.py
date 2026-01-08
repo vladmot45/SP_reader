@@ -22,19 +22,28 @@ BASE_COLS = {
     "Currency": "Currency",
     "Transport type": "Transport type",
     "Country": "Country",
+    "Ex rate USD": "Ex rate USD",
+    "Ex rate EUR": "Ex rate EUR",
+    "EUR/USD": "EUR/USD",
+    "Incoterms": "Incoterms",
 }
 
 HEADER_MARKERS = ["Contract", "Buyer", "Goods", "Price"]
 
 FINAL_ORDER = [
     "Date", "Contract", "Transport type", "Country", "Buyer","Buyer abbreviation", "Protein", "Goods sold", "Contract status",
-    "Delivery month", "Tonnes", "Price FCA", "Price Dap", "Currency", "Uwagi",
+    "Delivery month", "Tonnes", "Price FCA", "Price Dap", "Currency", "Ex rate USD", "Ex rate EUR", "EUR/USD", "Total price FCA",
+"Total price DAP", "Total Price FCA EUR",  "Total Price DAP EUR", "Incoterms", "Uwagi",
 ]
 
 
 def norm(s) -> str:
     s = "" if s is None else str(s)
     return re.sub(r"\s+", " ", s.strip())
+
+def first_non_empty_number(s: pd.Series):
+    s = s.map(clean_number).dropna()
+    return s.iloc[0] if len(s) else pd.NA
 
 
 def clean_number(x):
@@ -266,7 +275,7 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
     long_df = long_df.dropna(subset=["Tonnes"])
     long_df = long_df[long_df["Tonnes"] != 0]
 
-    for col in ["Goods sold", "Price FCA", "Price Dap"]:
+    for col in ["Goods sold", "Price FCA", "Price Dap","Ex rate USD", "Ex rate EUR", "EUR/USD"]:
         if col in long_df.columns:
             long_df[col] = long_df[col].apply(clean_number)
 
@@ -283,9 +292,13 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
         agg["Date"] = first_valid_datetime
 
     for col in ["Transport type", "Country", "Buyer", "Buyer abbreviation", "Protein", "Goods sold",
-                "Contract status", "Price FCA", "Price Dap", "Currency", "Uwagi"]:
+                "Contract status", "Currency","Incoterms", "Uwagi"]:
         if col in long_df.columns:
             agg[col] = first_non_empty_str
+    
+    for col in ["Price FCA", "Price Dap", "Ex rate USD", "Ex rate EUR", "EUR/USD"]:
+        if col in long_df.columns:
+            agg[col] = first_non_empty_number
 
     out = long_df.groupby(group_keys, as_index=False).agg(agg)
 
@@ -310,6 +323,54 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
 
     # Final column order
     out = out[[c for c in FINAL_ORDER if c in out.columns]]
+
+        # --- Total price columns ---
+    # make sure operands are numeric (clean_number already handles strings like "1 234,56" etc.)
+    if "Tonnes" in out.columns and "Price FCA" in out.columns:
+        out["Tonnes"] = out["Tonnes"].apply(clean_number)
+        out["Price FCA"] = out["Price FCA"].apply(clean_number)
+        out["Total price FCA"] = out["Tonnes"] * out["Price FCA"]
+    else:
+        out["Total price FCA"] = pd.NA
+
+    if "Tonnes" in out.columns and "Price Dap" in out.columns:
+        out["Price Dap"] = out["Price Dap"].apply(clean_number)
+        out["Total price DAP"] = out["Tonnes"] * out["Price Dap"]
+    else:
+        out["Total price DAP"] = pd.NA
+
+        # --- Ensure FX + Currency are clean ---
+    cur = out["Currency"].astype(str).str.strip().str.upper() if "Currency" in out.columns else ""
+
+    def to_float64_nullable(series: pd.Series) -> pd.Series:
+        # clean_number returns float or pd.NA; keep pd.NA safely with nullable Float64 dtype
+        return series.map(clean_number).astype("Float64")
+
+    # --- Total Price in EUR (based on Currency) ---
+    # EUR -> keep total as-is
+    # USD -> multiply by EUR/USD
+    # PLN -> Divide by Ex rate EUR
+    def to_eur(total_col: str) -> pd.Series:
+        if total_col not in out.columns:
+            return pd.Series(pd.NA, index=out.index, dtype="Float64")
+
+        total = to_float64_nullable(out[total_col])
+
+        fx_eurusd = to_float64_nullable(out["EUR/USD"]) if "EUR/USD" in out.columns else pd.Series(pd.NA, index=out.index, dtype="Float64")
+        fx_eurpln = to_float64_nullable(out["Ex rate EUR"]) if "Ex rate EUR" in out.columns else pd.Series(pd.NA, index=out.index, dtype="Float64")
+
+        res = pd.Series(pd.NA, index=out.index, dtype="Float64")
+
+        res = res.mask(cur.eq("EUR"), total)
+        res = res.mask(cur.eq("USD"), total * fx_eurusd)
+        res = res.mask(cur.eq("PLN"), total / fx_eurpln)
+
+        return res
+
+    out["Total Price FCA EUR"] = to_eur("Total price FCA")
+    out["Total Price DAP EUR"] = to_eur("Total price DAP")
+
+
 
     # ---- WRITE XLSX (no locale separator issues), keep Date as numeric with display format ----
     buffer = io.BytesIO()
