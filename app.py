@@ -5,6 +5,10 @@ import pandas as pd
 import streamlit as st
 
 
+# ---------------- CONFIG ----------------
+TARGET_SHEET = "SP"
+WAGI_SHEET_WANTED = "Wagi total"
+
 BASE_COLS = {
     "Date": "Date",
     "Contract": "Contract",
@@ -31,24 +35,33 @@ BASE_COLS = {
 HEADER_MARKERS = ["Contract", "Buyer", "Goods", "Price"]
 
 FINAL_ORDER = [
-    "Date", "Contract", "Transport type", "Country", "Buyer","Buyer abbreviation", "Protein", "Goods sold", "Contract status",
-    "Delivery month", "Tonnes", "Price FCA", "Price Dap",  "Currency", "Ex rate USD", "Ex rate EUR", "EUR/USD", "Price FCA EUR",
-"Price DAP EUR", "Total price FCA",
-    "Total price DAP", "Total Price FCA EUR",  "Total Price DAP EUR", "Incoterms", "Uwagi",
-    "Pick Up date", "Pick up quantity", "Pickup Total FCA", "Pickup Total DAP", "Pickup Total FCA EUR", "Pickup Total DAP EUR",
-
+    "Date", "Contract", "Transport type", "Country", "Buyer", "Buyer abbreviation", "Protein",
+    "Goods sold", "Contract status", "Delivery month", "Tonnes",
+    "Price FCA", "Price Dap", "Currency", "Ex rate USD", "Ex rate EUR", "EUR/USD",
+    "Price FCA EUR", "Price DAP EUR",
+    "Total price FCA", "Total price DAP", "Total Price FCA EUR", "Total Price DAP EUR",
+    "Incoterms", "Uwagi",
+    "Pick Up date", "Pick up quantity",
+    "Pickup Total FCA", "Pickup Total DAP", "Pickup Total FCA EUR", "Pickup Total DAP EUR",
 ]
 
 
-
+# ---------------- HELPERS ----------------
 def norm(s) -> str:
     s = "" if s is None else str(s)
     return re.sub(r"\s+", " ", s.strip())
 
-def first_non_empty_number(s: pd.Series):
-    s = s.map(clean_number).dropna()
-    return s.iloc[0] if len(s) else pd.NA
-
+def norm_key(x) -> str:
+    if pd.isna(x):
+        return ""
+    s = str(x)
+    s = s.replace("\u00A0", " ")          # NBSP
+    s = s.replace("\u200b", "")           # zero-width space
+    s = s.replace("\ufeff", "")           # BOM
+    s = s.replace("–", "-").replace("—", "-")
+    s = re.sub(r"[\x00-\x1f\x7f]", "", s) # control chars
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.upper()
 
 def clean_number(x):
     if pd.isna(x):
@@ -75,6 +88,19 @@ def clean_number(x):
     except ValueError:
         return pd.NA
 
+def first_non_empty_number(s: pd.Series):
+    s = s.map(clean_number).dropna()
+    return s.iloc[0] if len(s) else pd.NA
+
+def first_non_empty_str(s: pd.Series):
+    s = s.dropna().astype(str)
+    s = s[s.str.strip() != ""]
+    return s.iloc[0] if len(s) else pd.NA
+
+def first_valid_datetime(s: pd.Series):
+    s = pd.to_datetime(s, errors="coerce")
+    s = s.dropna()
+    return s.iloc[0] if len(s) else pd.NaT
 
 def find_header_row(preview: pd.DataFrame) -> int:
     best_i, best_score = 0, -1
@@ -88,7 +114,6 @@ def find_header_row(preview: pd.DataFrame) -> int:
         raise ValueError("Could not detect header row.")
     return best_i
 
-
 def pick_col(df_cols, wanted_label):
     wanted = wanted_label.lower().strip()
     for c in df_cols:
@@ -99,7 +124,6 @@ def pick_col(df_cols, wanted_label):
             return c
     return None
 
-
 def to_dt_if_possible(x):
     if isinstance(x, (pd.Timestamp, datetime)):
         return pd.to_datetime(x)
@@ -108,7 +132,6 @@ def to_dt_if_possible(x):
     except Exception:
         return None
 
-
 def build_columns_from_two_rows(raw: pd.DataFrame, header_row: int):
     top = raw.iloc[header_row - 1].tolist()
     bottom = raw.iloc[header_row].tolist()
@@ -116,11 +139,10 @@ def build_columns_from_two_rows(raw: pd.DataFrame, header_row: int):
     for t, b in zip(top, bottom):
         dt = to_dt_if_possible(t)
         if dt is not None and dt.day == 1:
-            cols.append(dt)          # month headers
+            cols.append(dt)
         else:
-            cols.append(norm(b))     # base headers
+            cols.append(norm(b))
     return cols
-
 
 def detect_month_columns(columns):
     month_cols = {}
@@ -138,46 +160,31 @@ def detect_month_columns(columns):
             except Exception:
                 continue
 
-        # only month headers: 1st of month
         if dt.day != 1:
             continue
 
-        # normalize to first-of-month (00:00)
         month_cols[col] = pd.Timestamp(dt.year, dt.month, 1)
-
     return month_cols
 
-
-def first_non_empty_str(s: pd.Series):
-    s = s.dropna().astype(str)
-    s = s[s.str.strip() != ""]
-    return s.iloc[0] if len(s) else pd.NA
+def to_float64_nullable(series: pd.Series) -> pd.Series:
+    return series.map(clean_number).astype("Float64")
 
 
-def first_valid_datetime(s: pd.Series):
-    s = pd.to_datetime(s, errors="coerce")
-    s = s.dropna()
-    return s.iloc[0] if len(s) else pd.NaT
-
-
+# ---------------- MAIN TRANSFORM ----------------
 def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
-    TARGET_SHEET = "SP"
-
-    # --- verify sheet exists ---
+    # ---- check SP sheet exists ----
     file_obj.seek(0)
     xl = pd.ExcelFile(file_obj, engine="openpyxl")
     if TARGET_SHEET not in xl.sheet_names:
         raise ValueError(f"Sheet '{TARGET_SHEET}' not found. Available sheets: {', '.join(xl.sheet_names)}")
 
-    # --- preview to detect header row ---
+    # ---- detect header row ----
     file_obj.seek(0)
-    raw_preview = pd.read_excel(
-        file_obj, sheet_name=TARGET_SHEET, header=None, nrows=400, engine="openpyxl"
-    )
+    raw_preview = pd.read_excel(file_obj, sheet_name=TARGET_SHEET, header=None, nrows=400, engine="openpyxl")
     header_row = find_header_row(raw_preview)
 
+    # ---- read SP ----
     file_obj.seek(0)
-
     if header_row == 0:
         df = pd.read_excel(file_obj, sheet_name=TARGET_SHEET, header=0, engine="openpyxl")
         df.columns = [c if isinstance(c, (pd.Timestamp, datetime)) else norm(c) for c in df.columns]
@@ -188,8 +195,7 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
         raw_full.columns = cols
         data_df = raw_full.iloc[header_row + 1:].copy()
 
-
-    # Resolve / rename base columns
+    # ---- rename base columns ----
     resolved = {}
     str_cols = [str(c) for c in data_df.columns]
     for excel_label, out_label in BASE_COLS.items():
@@ -200,24 +206,21 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
 
     base_df = data_df.rename(columns=resolved)
 
-                # ---- Buyer abbreviation: extract text inside parentheses ----
+    # Buyer abbreviation
     if "Buyer" in base_df.columns:
         def extract_abbr(x):
             if pd.isna(x):
                 return pd.NA
-            s = str(x)
-            m = re.search(r"\(([^)]+)\)", s)
-            if m:
-                return m.group(1).strip()
-            return pd.NA
+            m = re.search(r"\(([^)]+)\)", str(x))
+            return m.group(1).strip() if m else pd.NA
 
         base_df.insert(
             base_df.columns.get_loc("Buyer") + 1,
             "Buyer abbreviation",
-            base_df["Buyer"].apply(extract_abbr)
+            base_df["Buyer"].apply(extract_abbr),
         )
 
-    # ---- DATE CLEANING: drop invalid/blanks and KEEP datetime (Excel numeric) ----
+    # Date cleaning
     if "Date" in base_df.columns:
         s = (
             base_df["Date"]
@@ -228,196 +231,135 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
         )
         parsed = pd.to_datetime(s, dayfirst=True, errors="coerce")
         base_df = base_df.loc[parsed.notna()].copy()
-        base_df["Date"] = parsed.loc[parsed.notna()]  # keep datetime
+        base_df["Date"] = parsed.loc[parsed.notna()]
     else:
-        # you said: if no valid date, ignore row => if Date column missing, output nothing
         base_df = base_df.iloc[0:0].copy()
 
-    # Default / create Transport type
+    # Transport type default
     if "Transport type" in base_df.columns:
         base_df["Transport type"] = (
-            base_df["Transport type"]
-            .astype(str)
-            .str.strip()
+            base_df["Transport type"].astype(str).str.strip()
             .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
             .fillna("Trucks")
         )
     else:
         base_df["Transport type"] = "Trucks"
 
-    # Contract: blank -> N/A, and remove totals
+    # Contract cleaning
     if "Contract" in base_df.columns:
         base_df["Contract"] = (
-            base_df["Contract"]
-            .astype(str)
-            .str.strip()
+            base_df["Contract"].astype(str).str.strip()
             .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
             .fillna("N/A")
         )
         base_df = base_df[~base_df["Contract"].str.lower().str.contains("total", na=False)]
+    else:
+        base_df["Contract"] = "N/A"
 
     # Detect month columns
     month_cols = detect_month_columns(data_df.columns)
     if not month_cols:
         raise ValueError("No month columns found. Month headers must be dates (1st of month).")
 
-    # CLOSED contracts with zero deliveries across all month columns
-    closed_rows = pd.DataFrame()
-    if "Contract status" in base_df.columns and "Contract" in base_df.columns:
-        status = base_df["Contract status"].astype(str).str.lower().str.strip()
-        is_closed = status.eq("closed")
-
-        month_block = base_df[list(month_cols.keys())].apply(lambda col: col.map(clean_number))
-        month_sum = month_block.fillna(0).sum(axis=1)
-
-        closed_no_months = base_df[is_closed & (month_sum == 0)].copy()
-        if not closed_no_months.empty:
-            closed_rows = closed_no_months.copy()
-            closed_rows["Delivery month"] = pd.NaT
-            closed_rows["Tonnes"] = 0
-
-
-    # Melt to long format
-    id_vars = [c for c in FINAL_ORDER if c in base_df.columns and c not in ("Delivery month", "Tonnes")]
-
+    # Melt to long
+    id_vars = [c for c in base_df.columns if c not in month_cols.keys()]
     long_df = base_df.melt(
         id_vars=id_vars,
         value_vars=list(month_cols.keys()),
         var_name="Delivery month",
         value_name="Tonnes",
     )
-
-    long_df["Delivery month"] = long_df["Delivery month"].map(month_cols)  # "Mar 27"
+    long_df["Delivery month"] = long_df["Delivery month"].map(month_cols)
     long_df["Tonnes"] = long_df["Tonnes"].apply(clean_number)
-    long_df = long_df.dropna(subset=["Tonnes"])
-    long_df = long_df[long_df["Tonnes"] != 0]
 
-    for col in ["Goods sold", "Price FCA", "Price Dap","Ex rate USD", "Ex rate EUR", "EUR/USD"]:
-        if col in long_df.columns:
-            long_df[col] = long_df[col].apply(clean_number)
+    # Keep only delivered rows (non-zero tonnes) for the monthly part
+    delivered = long_df.dropna(subset=["Tonnes"])
+    delivered = delivered[delivered["Tonnes"] != 0].copy()
 
-    if "Uwagi" in long_df.columns:
-        long_df["Uwagi"] = long_df["Uwagi"].fillna("N/A")
+    # Clean numeric fields in delivered
+    for col in ["Goods sold", "Price FCA", "Price Dap", "Ex rate USD", "Ex rate EUR", "EUR/USD"]:
+        if col in delivered.columns:
+            delivered[col] = delivered[col].apply(clean_number)
 
-    group_keys = [c for c in ["Contract", "Delivery month"] if c in long_df.columns]
+    if "Uwagi" in delivered.columns:
+        delivered["Uwagi"] = delivered["Uwagi"].fillna("N/A")
+
+    # Group/aggregate delivered rows
+    group_keys = [c for c in ["Contract", "Delivery month"] if c in delivered.columns]
     if not group_keys:
-        raise ValueError("Cannot group output because Contract/Delivery month columns are missing after transform.")
+        raise ValueError("Cannot group output because Contract/Delivery month columns are missing.")
 
-    # Aggregation: Date must stay datetime; other fields as strings
     agg = {"Tonnes": "max"}
-    if "Date" in long_df.columns:
+    if "Date" in delivered.columns:
         agg["Date"] = first_valid_datetime
 
-    for col in ["Transport type", "Country", "Buyer", "Buyer abbreviation", "Protein", "Goods sold",
-                "Contract status", "Currency","Incoterms", "Uwagi"]:
-        if col in long_df.columns:
+    for col in ["Transport type", "Country", "Buyer", "Buyer abbreviation", "Protein",
+                "Contract status", "Currency", "Incoterms", "Uwagi"]:
+        if col in delivered.columns:
             agg[col] = first_non_empty_str
-    
-    for col in ["Price FCA", "Price Dap", "Ex rate USD", "Ex rate EUR", "EUR/USD"]:
-        if col in long_df.columns:
+
+    for col in ["Goods sold", "Price FCA", "Price Dap", "Ex rate USD", "Ex rate EUR", "EUR/USD"]:
+        if col in delivered.columns:
             agg[col] = first_non_empty_number
 
-    out = long_df.groupby(group_keys, as_index=False).agg(agg)
+    out = delivered.groupby(group_keys, as_index=False).agg(agg)
 
-    # Show "Goods sold" only once per Contract (0 for other months)
-    if "Goods sold" in out.columns and "Contract" in out.columns:
-        out["Goods sold"] = out["Goods sold"].apply(clean_number).fillna(0)
+    # --- totals (Tonnes * unit price) ---
+    out["Tonnes"] = out["Tonnes"].apply(clean_number)
 
-    if "Delivery month" in out.columns:
-        out = out.sort_values(["Contract", "Delivery month"], na_position="last")
-
-    first_mask = ~out.duplicated(subset=["Contract"])
-    out.loc[~first_mask, "Goods sold"] = 0
-
-
-    # Append closed contracts that have no monthly tonnes
-    if not closed_rows.empty:
-        for c in out.columns:
-            if c not in closed_rows.columns:
-                closed_rows[c] = pd.NA
-        closed_rows = closed_rows[out.columns]
-        out = pd.concat([out, closed_rows], ignore_index=True, sort=False)
-
-    # Final column order
-    out = out[[c for c in FINAL_ORDER if c in out.columns]]
-
-        # --- Total price columns ---
-    # make sure operands are numeric (clean_number already handles strings like "1 234,56" etc.)
-    if "Tonnes" in out.columns and "Price FCA" in out.columns:
-        out["Tonnes"] = out["Tonnes"].apply(clean_number)
+    if "Price FCA" in out.columns:
         out["Price FCA"] = out["Price FCA"].apply(clean_number)
         out["Total price FCA"] = out["Tonnes"] * out["Price FCA"]
     else:
         out["Total price FCA"] = pd.NA
 
-    if "Tonnes" in out.columns and "Price Dap" in out.columns:
+    if "Price Dap" in out.columns:
         out["Price Dap"] = out["Price Dap"].apply(clean_number)
         out["Total price DAP"] = out["Tonnes"] * out["Price Dap"]
     else:
         out["Total price DAP"] = pd.NA
 
-        # --- Ensure FX + Currency are clean ---
-    cur = out["Currency"].astype(str).str.strip().str.upper() if "Currency" in out.columns else ""
+    # --- FX conversions ---
+    cur = out["Currency"].astype(str).str.strip().str.upper() if "Currency" in out.columns else pd.Series("", index=out.index)
 
-    def to_float64_nullable(series: pd.Series) -> pd.Series:
-        # clean_number returns float or pd.NA; keep pd.NA safely with nullable Float64 dtype
-        return series.map(clean_number).astype("Float64")
-
-    # --- Total Price in EUR (based on Currency) ---
-    # EUR -> keep total as-is
-    # USD -> multiply by EUR/USD
-    # PLN -> Divide by Ex rate EUR
     def to_eur(total_col: str) -> pd.Series:
         if total_col not in out.columns:
             return pd.Series(pd.NA, index=out.index, dtype="Float64")
 
         total = to_float64_nullable(out[total_col])
-
         fx_eurusd = to_float64_nullable(out["EUR/USD"]) if "EUR/USD" in out.columns else pd.Series(pd.NA, index=out.index, dtype="Float64")
         fx_eurpln = to_float64_nullable(out["Ex rate EUR"]) if "Ex rate EUR" in out.columns else pd.Series(pd.NA, index=out.index, dtype="Float64")
 
         res = pd.Series(pd.NA, index=out.index, dtype="Float64")
-
         res = res.mask(cur.eq("EUR"), total)
         res = res.mask(cur.eq("USD"), total * fx_eurusd)
         res = res.mask(cur.eq("PLN"), total / fx_eurpln)
-
         return res
 
     out["Total Price FCA EUR"] = to_eur("Total price FCA")
     out["Total Price DAP EUR"] = to_eur("Total price DAP")
 
-        # --- Unit prices in EUR (based on Currency) ---
     def price_to_eur(price_col: str) -> pd.Series:
         if price_col not in out.columns:
             return pd.Series(pd.NA, index=out.index, dtype="Float64")
 
         price = to_float64_nullable(out[price_col])
-
         fx_eurusd = to_float64_nullable(out["EUR/USD"]) if "EUR/USD" in out.columns else pd.Series(pd.NA, index=out.index, dtype="Float64")
         fx_eurpln = to_float64_nullable(out["Ex rate EUR"]) if "Ex rate EUR" in out.columns else pd.Series(pd.NA, index=out.index, dtype="Float64")
 
         res = pd.Series(pd.NA, index=out.index, dtype="Float64")
-
         res = res.mask(cur.eq("EUR"), price)
         res = res.mask(cur.eq("USD"), price * fx_eurusd)
         res = res.mask(cur.eq("PLN"), price / fx_eurpln)
-
         return res
 
     out["Price FCA EUR"] = price_to_eur("Price FCA")
     out["Price DAP EUR"] = price_to_eur("Price Dap")
 
-    
-
-
-        # ----------------- Wagi total: Pick Up date + quantity -----------------
-    WAGI_SHEET_WANTED = "Wagi total"  # adjust only if the name differs
-
+    # ----------------- WAGI MERGE + ENSURE MISSING CONTRACTS EXIST -----------------
     file_obj.seek(0)
     xl2 = pd.ExcelFile(file_obj, engine="openpyxl")
 
-    # find sheet case-insensitively
     wagi_sheet = None
     for sn in xl2.sheet_names:
         if sn.strip().lower() == WAGI_SHEET_WANTED.strip().lower():
@@ -428,102 +370,170 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
         file_obj.seek(0)
         wagi_raw = pd.read_excel(file_obj, sheet_name=wagi_sheet, engine="openpyxl")
 
-        # pick the 3 columns we need (robust matching)
+        # contract col
         contract_col = None
         for c in wagi_raw.columns:
-            if str(c).strip().lower() in {"№ контракта", "no kontrakta", "nr kontrakta", "contract"}:
+            cl = str(c).strip().lower()
+            if cl in {"№ контракта", "no kontrakta", "nr kontrakta", "contract"} or "контракт" in cl:
                 contract_col = c
                 break
-        if contract_col is None:
-            # fallback: partial match
-            for c in wagi_raw.columns:
-                if "контракт" in str(c).strip().lower():
-                    contract_col = c
-                    break
 
+        # pick up date col
         date_col = None
         for c in wagi_raw.columns:
-            if str(c).strip().lower() in {"data wz", "pick up date"}:
+            if "data wz" in str(c).strip().lower():
                 date_col = c
                 break
 
+        # qty col
         qty_col = None
         for c in wagi_raw.columns:
-            if str(c).strip().lower() in {"q-ty", "qty", "quantity", "pick up quantity"}:
+            cl = str(c).strip().lower()
+            if "q-ty" in cl or "qty" in cl:
                 qty_col = c
                 break
 
-        if contract_col is not None and date_col is not None and qty_col is not None:
+        if contract_col and date_col and qty_col:
             wagi = wagi_raw[[contract_col, date_col, qty_col]].copy()
             wagi.columns = ["Contract", "Pick Up date", "Pick up quantity"]
 
-            # normalize keys + values
-            wagi["Contract"] = wagi["Contract"].astype(str).str.strip()
+            wagi["Contract_key"] = wagi["Contract"].apply(norm_key)
             wagi["Pick Up date"] = pd.to_datetime(wagi["Pick Up date"], dayfirst=True, errors="coerce")
-            wagi["Pick up quantity"] = wagi["Pick up quantity"].apply(clean_number)
+            wagi["Pick up quantity"] = wagi["Pick up quantity"].apply(clean_number) / 1000.0
+            wagi = wagi.dropna(subset=["Contract_key", "Pick Up date", "Pick up quantity"])
 
-            wagi = wagi.dropna(subset=["Contract", "Pick Up date", "Pick up quantity"])
-            wagi["Pick up quantity"] = wagi["Pick up quantity"] / 1000.0  # 25160 -> 25.160
+            # Ensure contracts that exist in Wagi also exist in out (even if no tonnes rows)
+            out_keys = set(out["Contract"].apply(norm_key)) if "Contract" in out.columns else set()
+            wagi_keys = set(wagi["Contract_key"])
+            missing_keys = wagi_keys - out_keys
 
-        
+            if missing_keys:
+                # Build contract-level placeholders from SP base_df
+                b = base_df.copy()
+                b["Contract_key"] = b["Contract"].apply(norm_key)
+                b = b[b["Contract_key"].isin(missing_keys)].copy()
 
-            # attach pickups ONLY to the first row per contract (prevents duplicating pickups for every delivery month)
+                if not b.empty:
+                    # aggregate one row per contract key
+                    def agg_or_na(col, fn):
+                        return fn if col in b.columns else (lambda s: pd.NA)
+
+                    placeholders = b.groupby("Contract_key", as_index=False).agg({
+                        "Contract": "first",
+                        "Date": agg_or_na("Date", first_valid_datetime),
+                        "Transport type": agg_or_na("Transport type", first_non_empty_str),
+                        "Country": agg_or_na("Country", first_non_empty_str),
+                        "Buyer": agg_or_na("Buyer", first_non_empty_str),
+                        "Buyer abbreviation": agg_or_na("Buyer abbreviation", first_non_empty_str),
+                        "Protein": agg_or_na("Protein", first_non_empty_str),
+                        "Goods sold": agg_or_na("Goods sold", first_non_empty_number),
+                        "Contract status": agg_or_na("Contract status", first_non_empty_str),
+                        "Currency": agg_or_na("Currency", first_non_empty_str),
+                        "Price FCA": agg_or_na("Price FCA", first_non_empty_number),
+                        "Price Dap": agg_or_na("Price Dap", first_non_empty_number),
+                        "Ex rate USD": agg_or_na("Ex rate USD", first_non_empty_number),
+                        "Ex rate EUR": agg_or_na("Ex rate EUR", first_non_empty_number),
+                        "EUR/USD": agg_or_na("EUR/USD", first_non_empty_number),
+                        "Incoterms": agg_or_na("Incoterms", first_non_empty_str),
+                        "Uwagi": agg_or_na("Uwagi", first_non_empty_str),
+                    })
+
+                    placeholders["Delivery month"] = pd.NaT
+                    placeholders["Tonnes"] = 0
+                    # recompute totals/fx for placeholders after concat later (we'll do pickup totals at end)
+                    out = pd.concat([out, placeholders.drop(columns=["Contract_key"])], ignore_index=True, sort=False)
+
+                    # recompute price EUR columns for newly appended rows
+                    cur2 = out["Currency"].astype(str).str.strip().str.upper() if "Currency" in out.columns else pd.Series("", index=out.index)
+
+                    def to_eur_any(df, colname):
+                        if colname not in df.columns:
+                            return pd.Series(pd.NA, index=df.index, dtype="Float64")
+                        total = to_float64_nullable(df[colname])
+                        fx_eurusd = to_float64_nullable(df["EUR/USD"]) if "EUR/USD" in df.columns else pd.Series(pd.NA, index=df.index, dtype="Float64")
+                        fx_eurpln = to_float64_nullable(df["Ex rate EUR"]) if "Ex rate EUR" in df.columns else pd.Series(pd.NA, index=df.index, dtype="Float64")
+                        res = pd.Series(pd.NA, index=df.index, dtype="Float64")
+                        res = res.mask(cur2.eq("EUR"), total)
+                        res = res.mask(cur2.eq("USD"), total * fx_eurusd)
+                        res = res.mask(cur2.eq("PLN"), total / fx_eurpln)
+                        return res
+
+                    # totals for placeholders
+                    out["Tonnes"] = out["Tonnes"].apply(clean_number)
+                    if "Price FCA" in out.columns:
+                        out["Price FCA"] = out["Price FCA"].apply(clean_number)
+                        out["Total price FCA"] = out["Tonnes"] * out["Price FCA"]
+                    if "Price Dap" in out.columns:
+                        out["Price Dap"] = out["Price Dap"].apply(clean_number)
+                        out["Total price DAP"] = out["Tonnes"] * out["Price Dap"]
+
+                    out["Total Price FCA EUR"] = to_eur_any(out, "Total price FCA")
+                    out["Total Price DAP EUR"] = to_eur_any(out, "Total price DAP")
+                    out["Price FCA EUR"] = to_eur_any(out, "Price FCA")
+                    out["Price DAP EUR"] = to_eur_any(out, "Price Dap")
+
+            # Attach pickups to first row per contract (after ensuring existence)
             if "Contract" in out.columns and len(out) > 0:
+                out = out.sort_values(["Contract", "Delivery month"], na_position="last").reset_index(drop=True)
+
                 first_mask2 = ~out.duplicated(subset=["Contract"])
                 base_first = out.loc[first_mask2].copy()
                 base_rest = out.loc[~first_mask2].copy()
 
-                merged_first = base_first.merge(wagi, on="Contract", how="left", suffixes=("", "_w"))
+                base_first["Contract_key"] = base_first["Contract"].apply(norm_key)
 
-                    # overwrite base cols with the merged ones, then drop the _w columns
-                for col in ["Pick Up date", "Pick up quantity"]:                 
+                merged_first = base_first.merge(
+                    wagi.drop(columns=["Contract"]),
+                    on="Contract_key",
+                    how="left",
+                    suffixes=("", "_w"),
+                )
+
+                # if any suffix columns appear, collapse them
+                for col in ["Pick Up date", "Pick up quantity"]:
                     wcol = f"{col}_w"
                     if wcol in merged_first.columns:
                         merged_first[col] = merged_first[wcol]
                         merged_first = merged_first.drop(columns=[wcol])
 
-                # merge creates Pick Up date / quantity from wagi; keep them
-                out = pd.concat([merged_first, base_rest], ignore_index=True, sort=False)
+                out = pd.concat([merged_first.drop(columns=["Contract_key"], errors="ignore"), base_rest], ignore_index=True, sort=False)
 
-                # optional: sort nicely
-                sort_cols = [c for c in ["Contract", "Delivery month", "Pick Up date"] if c in out.columns]
-                if sort_cols:
-                    out = out.sort_values(sort_cols, na_position="last").reset_index(drop=True)
-        else:
-            # sheet exists but missing needed columns -> still produce output without pickups
-            pass
-    # ----------------------------------------------------------------------
-    # --- Pickup totals = Pick up quantity * prices (AFTER Wagi merge) ---
-    def f64(series_name: str) -> pd.Series:
-        if series_name not in out.columns:
+    # ---- Goods sold only once per contract (after all appends/merges) ----
+    if "Contract" in out.columns:
+        out = out.sort_values(["Contract", "Delivery month", "Pick Up date"], na_position="last").reset_index(drop=True)
+        if "Goods sold" in out.columns:
+            out["Goods sold"] = out["Goods sold"].apply(clean_number).fillna(0)
+            first_mask = ~out.duplicated(subset=["Contract"])
+            out.loc[~first_mask, "Goods sold"] = 0
+
+    # ---- Pickup totals (AFTER wagi merge) ----
+    def f64(colname: str) -> pd.Series:
+        if colname not in out.columns:
             return pd.Series(pd.NA, index=out.index, dtype="Float64")
-        return out[series_name].map(clean_number).astype("Float64")
+        return out[colname].map(clean_number).astype("Float64")
 
     pu_qty = f64("Pick up quantity")
-
     out["Pickup Total FCA"] = pu_qty * f64("Price FCA")
     out["Pickup Total DAP"] = pu_qty * f64("Price Dap")
     out["Pickup Total FCA EUR"] = pu_qty * f64("Price FCA EUR")
     out["Pickup Total DAP EUR"] = pu_qty * f64("Price DAP EUR")
 
-    # Final column order (do this at the end so new columns are kept)
+    # Final column order
     out = out[[c for c in FINAL_ORDER if c in out.columns]]
 
-
-
-    # ---- WRITE XLSX (no locale separator issues), keep Date as numeric with display format ----
+    # ---- WRITE XLSX ----
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         out.to_excel(writer, index=False, sheet_name="Output")
         ws = writer.sheets["Output"]
 
         if "Date" in out.columns:
-            date_col_idx = out.columns.get_loc("Date") + 1  # Excel is 1-based
+            date_col_idx = out.columns.get_loc("Date") + 1
             for r in range(2, ws.max_row + 1):
                 cell = ws.cell(row=r, column=date_col_idx)
                 if isinstance(cell.value, (datetime, pd.Timestamp)):
                     cell.number_format = "DD/MM/YYYY"
-            # Format Delivery month as "Apr 26" but keep it numeric
+
         if "Delivery month" in out.columns:
             dm_col_idx = out.columns.get_loc("Delivery month") + 1
             for r in range(2, ws.max_row + 1):
@@ -531,6 +541,12 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
                 if isinstance(cell.value, (datetime, pd.Timestamp)):
                     cell.number_format = "mmm yy"
 
+        if "Pick Up date" in out.columns:
+            pu_col_idx = out.columns.get_loc("Pick Up date") + 1
+            for r in range(2, ws.max_row + 1):
+                cell = ws.cell(row=r, column=pu_col_idx)
+                if isinstance(cell.value, (datetime, pd.Timestamp)):
+                    cell.number_format = "DD.MM.YYYY"
 
     xlsx_bytes = buffer.getvalue()
 
@@ -542,6 +558,7 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
     return xlsx_bytes, meta
 
 
+# ---------------- STREAMLIT UI ----------------
 st.title("SP → Pivotable data converter (XLSX output)")
 
 uploaded = st.file_uploader("Upload SP file (.xlsx/.xlsm/.xls)", type=["xlsx", "xlsm", "xls"])
