@@ -32,9 +32,13 @@ HEADER_MARKERS = ["Contract", "Buyer", "Goods", "Price"]
 
 FINAL_ORDER = [
     "Date", "Contract", "Transport type", "Country", "Buyer","Buyer abbreviation", "Protein", "Goods sold", "Contract status",
-    "Delivery month", "Tonnes", "Price FCA", "Price Dap", "Currency", "Ex rate USD", "Ex rate EUR", "EUR/USD", "Total price FCA",
-"Total price DAP", "Total Price FCA EUR",  "Total Price DAP EUR", "Incoterms", "Uwagi",
+    "Delivery month", "Tonnes", "Price FCA", "Price Dap",  "Currency", "Ex rate USD", "Ex rate EUR", "EUR/USD", "Price FCA EUR",
+"Price DAP EUR", "Total price FCA",
+    "Total price DAP", "Total Price FCA EUR",  "Total Price DAP EUR", "Incoterms", "Uwagi",
+    "Pick Up date", "Pick up quantity", "Pickup Total FCA", "Pickup Total DAP", "Pickup Total FCA EUR", "Pickup Total DAP EUR",
+
 ]
+
 
 
 def norm(s) -> str:
@@ -157,20 +161,33 @@ def first_valid_datetime(s: pd.Series):
 
 
 def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
-    raw_preview = pd.read_excel(file_obj, sheet_name=0, header=None, nrows=400, engine="openpyxl")
+    TARGET_SHEET = "SP"
+
+    # --- verify sheet exists ---
+    file_obj.seek(0)
+    xl = pd.ExcelFile(file_obj, engine="openpyxl")
+    if TARGET_SHEET not in xl.sheet_names:
+        raise ValueError(f"Sheet '{TARGET_SHEET}' not found. Available sheets: {', '.join(xl.sheet_names)}")
+
+    # --- preview to detect header row ---
+    file_obj.seek(0)
+    raw_preview = pd.read_excel(
+        file_obj, sheet_name=TARGET_SHEET, header=None, nrows=400, engine="openpyxl"
+    )
     header_row = find_header_row(raw_preview)
 
     file_obj.seek(0)
 
     if header_row == 0:
-        df = pd.read_excel(file_obj, sheet_name=0, header=0, engine="openpyxl")
+        df = pd.read_excel(file_obj, sheet_name=TARGET_SHEET, header=0, engine="openpyxl")
         df.columns = [c if isinstance(c, (pd.Timestamp, datetime)) else norm(c) for c in df.columns]
         data_df = df.copy()
     else:
-        raw_full = pd.read_excel(file_obj, sheet_name=0, header=None, engine="openpyxl")
+        raw_full = pd.read_excel(file_obj, sheet_name=TARGET_SHEET, header=None, engine="openpyxl")
         cols = build_columns_from_two_rows(raw_full, header_row)
         raw_full.columns = cols
         data_df = raw_full.iloc[header_row + 1:].copy()
+
 
     # Resolve / rename base columns
     resolved = {}
@@ -369,6 +386,128 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
 
     out["Total Price FCA EUR"] = to_eur("Total price FCA")
     out["Total Price DAP EUR"] = to_eur("Total price DAP")
+
+        # --- Unit prices in EUR (based on Currency) ---
+    def price_to_eur(price_col: str) -> pd.Series:
+        if price_col not in out.columns:
+            return pd.Series(pd.NA, index=out.index, dtype="Float64")
+
+        price = to_float64_nullable(out[price_col])
+
+        fx_eurusd = to_float64_nullable(out["EUR/USD"]) if "EUR/USD" in out.columns else pd.Series(pd.NA, index=out.index, dtype="Float64")
+        fx_eurpln = to_float64_nullable(out["Ex rate EUR"]) if "Ex rate EUR" in out.columns else pd.Series(pd.NA, index=out.index, dtype="Float64")
+
+        res = pd.Series(pd.NA, index=out.index, dtype="Float64")
+
+        res = res.mask(cur.eq("EUR"), price)
+        res = res.mask(cur.eq("USD"), price * fx_eurusd)
+        res = res.mask(cur.eq("PLN"), price / fx_eurpln)
+
+        return res
+
+    out["Price FCA EUR"] = price_to_eur("Price FCA")
+    out["Price DAP EUR"] = price_to_eur("Price Dap")
+
+    
+
+
+        # ----------------- Wagi total: Pick Up date + quantity -----------------
+    WAGI_SHEET_WANTED = "Wagi total"  # adjust only if the name differs
+
+    file_obj.seek(0)
+    xl2 = pd.ExcelFile(file_obj, engine="openpyxl")
+
+    # find sheet case-insensitively
+    wagi_sheet = None
+    for sn in xl2.sheet_names:
+        if sn.strip().lower() == WAGI_SHEET_WANTED.strip().lower():
+            wagi_sheet = sn
+            break
+
+    if wagi_sheet is not None:
+        file_obj.seek(0)
+        wagi_raw = pd.read_excel(file_obj, sheet_name=wagi_sheet, engine="openpyxl")
+
+        # pick the 3 columns we need (robust matching)
+        contract_col = None
+        for c in wagi_raw.columns:
+            if str(c).strip().lower() in {"№ контракта", "no kontrakta", "nr kontrakta", "contract"}:
+                contract_col = c
+                break
+        if contract_col is None:
+            # fallback: partial match
+            for c in wagi_raw.columns:
+                if "контракт" in str(c).strip().lower():
+                    contract_col = c
+                    break
+
+        date_col = None
+        for c in wagi_raw.columns:
+            if str(c).strip().lower() in {"data wz", "pick up date"}:
+                date_col = c
+                break
+
+        qty_col = None
+        for c in wagi_raw.columns:
+            if str(c).strip().lower() in {"q-ty", "qty", "quantity", "pick up quantity"}:
+                qty_col = c
+                break
+
+        if contract_col is not None and date_col is not None and qty_col is not None:
+            wagi = wagi_raw[[contract_col, date_col, qty_col]].copy()
+            wagi.columns = ["Contract", "Pick Up date", "Pick up quantity"]
+
+            # normalize keys + values
+            wagi["Contract"] = wagi["Contract"].astype(str).str.strip()
+            wagi["Pick Up date"] = pd.to_datetime(wagi["Pick Up date"], dayfirst=True, errors="coerce")
+            wagi["Pick up quantity"] = wagi["Pick up quantity"].apply(clean_number)
+
+            wagi = wagi.dropna(subset=["Contract", "Pick Up date", "Pick up quantity"])
+            wagi["Pick up quantity"] = wagi["Pick up quantity"] / 1000.0  # 25160 -> 25.160
+
+        
+
+            # attach pickups ONLY to the first row per contract (prevents duplicating pickups for every delivery month)
+            if "Contract" in out.columns and len(out) > 0:
+                first_mask2 = ~out.duplicated(subset=["Contract"])
+                base_first = out.loc[first_mask2].copy()
+                base_rest = out.loc[~first_mask2].copy()
+
+                merged_first = base_first.merge(wagi, on="Contract", how="left", suffixes=("", "_w"))
+
+                    # overwrite base cols with the merged ones, then drop the _w columns
+                for col in ["Pick Up date", "Pick up quantity"]:                 
+                    wcol = f"{col}_w"
+                    if wcol in merged_first.columns:
+                        merged_first[col] = merged_first[wcol]
+                        merged_first = merged_first.drop(columns=[wcol])
+
+                # merge creates Pick Up date / quantity from wagi; keep them
+                out = pd.concat([merged_first, base_rest], ignore_index=True, sort=False)
+
+                # optional: sort nicely
+                sort_cols = [c for c in ["Contract", "Delivery month", "Pick Up date"] if c in out.columns]
+                if sort_cols:
+                    out = out.sort_values(sort_cols, na_position="last").reset_index(drop=True)
+        else:
+            # sheet exists but missing needed columns -> still produce output without pickups
+            pass
+    # ----------------------------------------------------------------------
+    # --- Pickup totals = Pick up quantity * prices (AFTER Wagi merge) ---
+    def f64(series_name: str) -> pd.Series:
+        if series_name not in out.columns:
+            return pd.Series(pd.NA, index=out.index, dtype="Float64")
+        return out[series_name].map(clean_number).astype("Float64")
+
+    pu_qty = f64("Pick up quantity")
+
+    out["Pickup Total FCA"] = pu_qty * f64("Price FCA")
+    out["Pickup Total DAP"] = pu_qty * f64("Price Dap")
+    out["Pickup Total FCA EUR"] = pu_qty * f64("Price FCA EUR")
+    out["Pickup Total DAP EUR"] = pu_qty * f64("Price DAP EUR")
+
+    # Final column order (do this at the end so new columns are kept)
+    out = out[[c for c in FINAL_ORDER if c in out.columns]]
 
 
 
