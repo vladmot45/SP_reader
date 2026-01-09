@@ -1,6 +1,8 @@
 import re
 from datetime import datetime
 import io
+from pathlib import Path
+
 import pandas as pd
 import streamlit as st
 
@@ -10,6 +12,9 @@ TARGET_SHEET = "SP"
 WAGI_SHEET_WANTED = "Wagi total"
 
 BASE_COLS = {
+    "Season": "Season",
+    "SEASON": "Season",
+
     "Date": "Date",
     "Contract": "Contract",
     "Buyer": "Buyer",
@@ -30,11 +35,16 @@ BASE_COLS = {
     "Ex rate EUR": "Ex rate EUR",
     "EUR/USD": "EUR/USD",
     "Incoterms": "Incoterms",
+
+    # NEW
+    "Trader": "Trader",
+    "TRADER": "Trader",
 }
 
 HEADER_MARKERS = ["Contract", "Buyer", "Goods", "Price"]
 
 FINAL_ORDER = [
+    "Season", "Trader",  # NEW: Trader
     "Date", "Contract", "Transport type", "Country", "Buyer", "Buyer abbreviation", "Protein",
     "Goods sold", "Contract status", "Delivery month", "Tonnes",
     "Price FCA", "Price Dap", "Currency", "Ex rate USD", "Ex rate EUR", "EUR/USD",
@@ -51,6 +61,7 @@ def norm(s) -> str:
     s = "" if s is None else str(s)
     return re.sub(r"\s+", " ", s.strip())
 
+
 def norm_key(x) -> str:
     if pd.isna(x):
         return ""
@@ -62,6 +73,7 @@ def norm_key(x) -> str:
     s = re.sub(r"[\x00-\x1f\x7f]", "", s) # control chars
     s = re.sub(r"\s+", " ", s).strip()
     return s.upper()
+
 
 def clean_number(x):
     if pd.isna(x):
@@ -88,19 +100,23 @@ def clean_number(x):
     except ValueError:
         return pd.NA
 
+
 def first_non_empty_number(s: pd.Series):
     s = s.map(clean_number).dropna()
     return s.iloc[0] if len(s) else pd.NA
+
 
 def first_non_empty_str(s: pd.Series):
     s = s.dropna().astype(str)
     s = s[s.str.strip() != ""]
     return s.iloc[0] if len(s) else pd.NA
 
+
 def first_valid_datetime(s: pd.Series):
     s = pd.to_datetime(s, errors="coerce")
     s = s.dropna()
     return s.iloc[0] if len(s) else pd.NaT
+
 
 def find_header_row(preview: pd.DataFrame) -> int:
     best_i, best_score = 0, -1
@@ -114,6 +130,7 @@ def find_header_row(preview: pd.DataFrame) -> int:
         raise ValueError("Could not detect header row.")
     return best_i
 
+
 def pick_col(df_cols, wanted_label):
     wanted = wanted_label.lower().strip()
     for c in df_cols:
@@ -124,6 +141,7 @@ def pick_col(df_cols, wanted_label):
             return c
     return None
 
+
 def to_dt_if_possible(x):
     if isinstance(x, (pd.Timestamp, datetime)):
         return pd.to_datetime(x)
@@ -132,17 +150,23 @@ def to_dt_if_possible(x):
     except Exception:
         return None
 
+
 def build_columns_from_two_rows(raw: pd.DataFrame, header_row: int):
     top = raw.iloc[header_row - 1].tolist()
     bottom = raw.iloc[header_row].tolist()
     cols = []
+
     for t, b in zip(top, bottom):
         dt = to_dt_if_possible(t)
         if dt is not None and dt.day == 1:
-            cols.append(dt)
+            cols.append(dt)  # month headers
         else:
-            cols.append(norm(b))
+            bt = norm(b)
+            tt = norm(t)
+            cols.append(bt if bt != "" else tt)
+
     return cols
+
 
 def detect_month_columns(columns):
     month_cols = {}
@@ -166,8 +190,32 @@ def detect_month_columns(columns):
         month_cols[col] = pd.Timestamp(dt.year, dt.month, 1)
     return month_cols
 
+
 def to_float64_nullable(series: pd.Series) -> pd.Series:
     return series.map(clean_number).astype("Float64")
+
+
+def coalesce_columns_rowwise(df: pd.DataFrame, cols: list) -> pd.Series:
+    """
+    Return first non-empty value across given columns per row.
+    """
+    if not cols:
+        return pd.Series(pd.NA, index=df.index)
+
+    tmp = df[cols].copy()
+    for c in cols:
+        tmp[c] = (
+            tmp[c]
+            .astype("string")
+            .str.replace("\u00A0", " ", regex=False)
+            .str.strip()
+            .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "none": pd.NA, "null": pd.NA})
+        )
+
+    out = tmp.iloc[:, 0]
+    for c in tmp.columns[1:]:
+        out = out.fillna(tmp[c])
+    return out
 
 
 # ---------------- MAIN TRANSFORM ----------------
@@ -205,6 +253,54 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
             resolved[real_col] = out_label
 
     base_df = data_df.rename(columns=resolved)
+
+    # ---- Season: robust detection + coalesce (fixes "some contracts missing") ----
+    # Find candidates: columns named like Season / contain Season after normalization
+    season_candidates = []
+    for c in data_df.columns:
+        k = norm_key(c)
+        if k == "SEASON" or "SEASON" in k:
+            season_candidates.append(c)
+
+    # If rename already created Season, include it too
+    if "Season" in base_df.columns:
+        # base_df column could come from one candidate; still coalesce with others if exist
+        season_src_cols = []
+        # map candidates to base_df columns if they were renamed
+        for c in season_candidates:
+            if c in base_df.columns:
+                season_src_cols.append(c)
+            elif c in data_df.columns and c in base_df.columns:
+                season_src_cols.append(c)
+        # also include any other raw columns that were renamed to Season
+        season_cols_in_base = [c for c in base_df.columns if norm_key(c) == "SEASON"]
+        season_src_cols = list(dict.fromkeys(season_cols_in_base + season_src_cols + ["Season"]))
+        base_df["Season"] = coalesce_columns_rowwise(base_df, [c for c in season_src_cols if c in base_df.columns])
+    else:
+        # Create Season if missing
+        # Use raw candidates from data_df (pre-rename) if they survived as columns in base_df
+        candidates_in_base = [c for c in season_candidates if c in base_df.columns]
+        if candidates_in_base:
+            base_df["Season"] = coalesce_columns_rowwise(base_df, candidates_in_base)
+        else:
+            # last fallback: scan columns whose header text contains season
+            fallback = [c for c in base_df.columns if "SEASON" in norm_key(c)]
+            base_df["Season"] = coalesce_columns_rowwise(base_df, fallback) if fallback else pd.NA
+
+    # ---- Trader: robust detection (new) ----
+    trader_candidates = []
+    for c in data_df.columns:
+        k = norm_key(c)
+        if k == "TRADER" or "TRADER" in k:
+            trader_candidates.append(c)
+
+    if "Trader" in base_df.columns:
+        trader_cols_in_base = [c for c in base_df.columns if norm_key(c) == "TRADER"]
+        trader_src_cols = list(dict.fromkeys(trader_cols_in_base + ["Trader"] + [c for c in trader_candidates if c in base_df.columns]))
+        base_df["Trader"] = coalesce_columns_rowwise(base_df, [c for c in trader_src_cols if c in base_df.columns])
+    else:
+        candidates_in_base = [c for c in trader_candidates if c in base_df.columns]
+        base_df["Trader"] = coalesce_columns_rowwise(base_df, candidates_in_base) if candidates_in_base else pd.NA
 
     # Buyer abbreviation
     if "Buyer" in base_df.columns:
@@ -293,8 +389,11 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
     if "Date" in delivered.columns:
         agg["Date"] = first_valid_datetime
 
-    for col in ["Transport type", "Country", "Buyer", "Buyer abbreviation", "Protein",
-                "Contract status", "Currency", "Incoterms", "Uwagi"]:
+    for col in [
+        "Transport type", "Country", "Buyer", "Buyer abbreviation", "Protein",
+        "Contract status", "Currency", "Incoterms", "Uwagi",
+        "Season", "Trader"  # NEW: include Trader, Season
+    ]:
         if col in delivered.columns:
             agg[col] = first_non_empty_str
 
@@ -414,13 +513,14 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
                 b = b[b["Contract_key"].isin(missing_keys)].copy()
 
                 if not b.empty:
-                    # aggregate one row per contract key
                     def agg_or_na(col, fn):
                         return fn if col in b.columns else (lambda s: pd.NA)
 
                     placeholders = b.groupby("Contract_key", as_index=False).agg({
                         "Contract": "first",
                         "Date": agg_or_na("Date", first_valid_datetime),
+                        "Season": agg_or_na("Season", first_non_empty_str),   # FIX: Season included
+                        "Trader": agg_or_na("Trader", first_non_empty_str),   # NEW: Trader included
                         "Transport type": agg_or_na("Transport type", first_non_empty_str),
                         "Country": agg_or_na("Country", first_non_empty_str),
                         "Buyer": agg_or_na("Buyer", first_non_empty_str),
@@ -440,10 +540,10 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
 
                     placeholders["Delivery month"] = pd.NaT
                     placeholders["Tonnes"] = 0
-                    # recompute totals/fx for placeholders after concat later (we'll do pickup totals at end)
+
                     out = pd.concat([out, placeholders.drop(columns=["Contract_key"])], ignore_index=True, sort=False)
 
-                    # recompute price EUR columns for newly appended rows
+                    # recompute totals/fx for newly appended rows
                     cur2 = out["Currency"].astype(str).str.strip().str.upper() if "Currency" in out.columns else pd.Series("", index=out.index)
 
                     def to_eur_any(df, colname):
@@ -458,7 +558,6 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
                         res = res.mask(cur2.eq("PLN"), total / fx_eurpln)
                         return res
 
-                    # totals for placeholders
                     out["Tonnes"] = out["Tonnes"].apply(clean_number)
                     if "Price FCA" in out.columns:
                         out["Price FCA"] = out["Price FCA"].apply(clean_number)
@@ -489,14 +588,17 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
                     suffixes=("", "_w"),
                 )
 
-                # if any suffix columns appear, collapse them
                 for col in ["Pick Up date", "Pick up quantity"]:
                     wcol = f"{col}_w"
                     if wcol in merged_first.columns:
                         merged_first[col] = merged_first[wcol]
                         merged_first = merged_first.drop(columns=[wcol])
 
-                out = pd.concat([merged_first.drop(columns=["Contract_key"], errors="ignore"), base_rest], ignore_index=True, sort=False)
+                out = pd.concat(
+                    [merged_first.drop(columns=["Contract_key"], errors="ignore"), base_rest],
+                    ignore_index=True,
+                    sort=False
+                )
 
     # ---- Goods sold only once per contract (after all appends/merges) ----
     if "Contract" in out.columns:
@@ -573,7 +675,6 @@ if uploaded:
             + (" ..." if len(meta['month_cols_detected']) > 10 else "")
         )
 
-        from pathlib import Path
         output_name = Path(uploaded.name).stem + "_output.xlsx"
 
         st.download_button(
