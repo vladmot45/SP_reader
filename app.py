@@ -176,19 +176,26 @@ def detect_month_columns(columns):
             continue
 
         dt = None
+
+        # If already a datetime-like header
         if isinstance(col, (pd.Timestamp, datetime)):
             dt = pd.to_datetime(col)
         else:
-            try:
-                dt = pd.to_datetime(col, dayfirst=True, errors="raise")
-            except Exception:
-                continue
+            # Try parsing strings like "Dec-25", "Dec-2", "01.12.2025", etc.
+            dt = pd.to_datetime(str(col), dayfirst=True, errors="coerce")
 
-        if dt.day != 1:
+            # Extra help for "Nov-25" style headers (if coercion failed)
+            if pd.isna(dt):
+                dt = pd.to_datetime(str(col), format="%b-%y", errors="coerce")
+
+        if pd.isna(dt):
             continue
 
+        # Normalize to first day of that month (this is what you actually want)
         month_cols[col] = pd.Timestamp(dt.year, dt.month, 1)
+
     return month_cols
+
 
 
 def to_float64_nullable(series: pd.Series) -> pd.Series:
