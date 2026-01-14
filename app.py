@@ -652,6 +652,17 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
             first_mask = ~out.duplicated(subset=["Contract"])
             out.loc[~first_mask, "Goods sold"] = 0
 
+    # ---- Tonnes only once per Contract + Delivery month (so pivots work cleanly) ----
+    if "Contract" in out.columns and "Delivery month" in out.columns:
+        out = out.sort_values(["Contract", "Delivery month", "Pick Up date"], na_position="last").reset_index(drop=True)
+
+        # ensure numeric, then blank out duplicates
+        out["Tonnes"] = out["Tonnes"].apply(clean_number).fillna(0)
+
+        first_tonnes_mask = ~out.duplicated(subset=["Contract", "Delivery month"])
+        out.loc[~first_tonnes_mask, "Tonnes"] = 0
+
+
     # ---- Pickup totals (AFTER wagi merge) ----
     def f64(colname: str) -> pd.Series:
         if colname not in out.columns:
