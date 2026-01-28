@@ -650,7 +650,7 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
         if "Goods sold" in out.columns:
             out["Goods sold"] = out["Goods sold"].apply(clean_number).fillna(0)
             first_mask = ~out.duplicated(subset=["Contract"])
-            out.loc[~first_mask, "Goods sold"] = 0
+            out.loc[~first_mask, "Goods sold"] = "-"
 
     # ---- Tonnes only once per Contract + Delivery month (so pivots work cleanly) ----
     if "Contract" in out.columns and "Delivery month" in out.columns:
@@ -660,7 +660,7 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
         out["Tonnes"] = out["Tonnes"].apply(clean_number).fillna(0)
 
         first_tonnes_mask = ~out.duplicated(subset=["Contract", "Delivery month"])
-        out.loc[~first_tonnes_mask, "Tonnes"] = 0
+        out.loc[~first_tonnes_mask, "Tonnes"] = "-"
 
 
     # ---- Pickup totals (AFTER wagi merge) ----
