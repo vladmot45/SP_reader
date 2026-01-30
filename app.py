@@ -14,7 +14,6 @@ WAGI_SHEET_WANTED = "Wagi total"
 BASE_COLS = {
     "Season": "Season",
     "SEASON": "Season",
-
     "Date": "Date",
     "Contract": "Contract",
     "Buyer": "Buyer",
@@ -35,8 +34,6 @@ BASE_COLS = {
     "Ex rate EUR": "Ex rate EUR",
     "EUR/USD": "EUR/USD",
     "Incoterms": "Incoterms",
-
-    # NEW
     "Trader": "Trader",
     "TRADER": "Trader",
 }
@@ -119,9 +116,6 @@ def first_valid_datetime(s: pd.Series):
 
 
 def join_unique_non_empty_str(s: pd.Series, sep="/"):
-    """
-    Join unique non-empty strings (first-seen order), e.g. Season1/Season2.
-    """
     if s is None or len(s) == 0:
         return pd.NA
     s2 = s.dropna().astype(str).map(lambda x: x.strip())
@@ -133,9 +127,6 @@ def join_unique_non_empty_str(s: pd.Series, sep="/"):
 
 
 def sum_non_empty_number(s: pd.Series):
-    """
-    Sum numeric values (after clean_number). Returns pd.NA if nothing to sum.
-    """
     if s is None or len(s) == 0:
         return pd.NA
     vals = s.map(clean_number).dropna()
@@ -181,16 +172,14 @@ def build_columns_from_two_rows(raw: pd.DataFrame, header_row: int):
     top = raw.iloc[header_row - 1].tolist()
     bottom = raw.iloc[header_row].tolist()
     cols = []
-
     for t, b in zip(top, bottom):
         dt = to_dt_if_possible(t)
         if dt is not None and dt.day == 1:
-            cols.append(dt)  # month headers
+            cols.append(dt)
         else:
             bt = norm(b)
             tt = norm(t)
             cols.append(bt if bt != "" else tt)
-
     return cols
 
 
@@ -213,7 +202,6 @@ def detect_month_columns(columns):
             continue
 
         month_cols[col] = pd.Timestamp(dt.year, dt.month, 1)
-
     return month_cols
 
 
@@ -222,9 +210,6 @@ def to_float64_nullable(series: pd.Series) -> pd.Series:
 
 
 def coalesce_columns_rowwise(df: pd.DataFrame, cols: list) -> pd.Series:
-    """
-    Return first non-empty value across given columns per row.
-    """
     if not cols:
         return pd.Series(pd.NA, index=df.index)
 
@@ -244,8 +229,13 @@ def coalesce_columns_rowwise(df: pd.DataFrame, cols: list) -> pd.Series:
     return out
 
 
+def normalize_date(d):
+    d = pd.to_datetime(d, errors="coerce", dayfirst=True)
+    return d.normalize() if not pd.isna(d) else pd.NaT
+
+
 # ---------------- MAIN TRANSFORM ----------------
-def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
+def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     # ---- check SP sheet exists ----
     file_obj.seek(0)
     xl = pd.ExcelFile(file_obj, engine="openpyxl")
@@ -277,7 +267,6 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
         if c_str is not None:
             real_col = next(col for col in data_df.columns if str(col) == c_str)
             resolved[real_col] = out_label
-
     base_df = data_df.rename(columns=resolved)
 
     # ---- Season: robust detection + coalesce ----
@@ -467,7 +456,7 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
     out["Price FCA EUR"] = price_to_eur("Price FCA")
     out["Price DAP EUR"] = price_to_eur("Price Dap")
 
-    # ----------------- WAGI MERGE + ENSURE MISSING CONTRACTS EXIST -----------------
+    # ----------------- WAGI LOAD + MERGE -----------------
     file_obj.seek(0)
     xl2 = pd.ExcelFile(file_obj, engine="openpyxl")
 
@@ -476,6 +465,13 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
         if sn.strip().lower() == WAGI_SHEET_WANTED.strip().lower():
             wagi_sheet = sn
             break
+
+    # these will be returned to streamlit (even if empty)
+    wagi_raw = pd.DataFrame()
+    wagi = pd.DataFrame()
+    lost_in_output = pd.DataFrame()
+    qty_mismatch = pd.DataFrame()
+    contract_recon = pd.DataFrame()
 
     if wagi_sheet is not None:
         file_obj.seek(0)
@@ -511,15 +507,15 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
             wagi["Contract_key"] = wagi["Contract"].apply(norm_key)
             wagi["Pick Up date"] = pd.to_datetime(wagi["Pick Up date"], dayfirst=True, errors="coerce")
             wagi["Pick up quantity"] = wagi["Pick up quantity"].apply(clean_number) / 1000.0
-            wagi = wagi.dropna(subset=["Contract_key", "Pick Up date", "Pick up quantity"])
+            # NOTE: keep original wagi for diagnostics; only drop for merge usage
+            wagi_merge = wagi.dropna(subset=["Contract_key", "Pick Up date", "Pick up quantity"]).copy()
 
-            # Ensure contracts that exist in Wagi also exist in out (even if no tonnes rows)
+            # Ensure contracts that exist in Wagi also exist in out
             out_keys = set(out["Contract"].apply(norm_key)) if "Contract" in out.columns else set()
-            wagi_keys = set(wagi["Contract_key"])
+            wagi_keys = set(wagi_merge["Contract_key"])
             missing_keys = wagi_keys - out_keys
 
             if missing_keys:
-                # Build contract-level placeholders from SP base_df
                 b = base_df.copy()
                 b["Contract_key"] = b["Contract"].apply(norm_key)
                 b = b[b["Contract_key"].isin(missing_keys)].copy()
@@ -555,7 +551,7 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
 
                     out = pd.concat([out, placeholders.drop(columns=["Contract_key"])], ignore_index=True, sort=False)
 
-                    # recompute totals/fx for newly appended rows
+                    # recompute totals/fx for appended rows
                     cur2 = out["Currency"].astype(str).str.strip().str.upper() if "Currency" in out.columns else pd.Series("", index=out.index)
 
                     def to_eur_any(df, colname):
@@ -583,7 +579,7 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
                     out["Price FCA EUR"] = to_eur_any(out, "Price FCA")
                     out["Price DAP EUR"] = to_eur_any(out, "Price Dap")
 
-            # Attach pickups to first row per contract (after ensuring existence)
+            # Attach pickups to first row per contract
             if "Contract" in out.columns and len(out) > 0:
                 out = out.sort_values(["Contract", "Delivery month"], na_position="last").reset_index(drop=True)
 
@@ -594,7 +590,7 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
                 base_first["Contract_key"] = base_first["Contract"].apply(norm_key)
 
                 merged_first = base_first.merge(
-                    wagi.drop(columns=["Contract"]),
+                    wagi_merge.drop(columns=["Contract"]),
                     on="Contract_key",
                     how="left",
                     suffixes=("", "_w"),
@@ -611,6 +607,72 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
                     ignore_index=True,
                     sort=False
                 )
+
+            # ----------------- DIAGNOSTICS: WAGI vs OUTPUT RECONCILIATION -----------------
+            # Truth: Wagi quantities summed by Contract_key + date (normalized)
+            wagi_check = wagi.copy()
+            wagi_check["Pick Up date"] = wagi_check["Pick Up date"].apply(normalize_date)
+            wagi_check["Pick up quantity"] = wagi_check["Pick up quantity"].apply(clean_number)
+
+            wagi_truth = (
+                wagi_check
+                .dropna(subset=["Contract_key", "Pick Up date"])
+                .groupby(["Contract_key", "Pick Up date"], as_index=False)["Pick up quantity"]
+                .sum()
+                .rename(columns={"Pick up quantity": "wagi_qty_t"})
+            )
+
+            # Result: Output quantities summed by Contract_key + date (normalized)
+            out_check = out.copy()
+            out_check["Contract_key"] = out_check["Contract"].apply(norm_key)
+            if "Pick Up date" in out_check.columns:
+                out_check["Pick Up date"] = out_check["Pick Up date"].apply(normalize_date)
+            else:
+                out_check["Pick Up date"] = pd.NaT
+
+            if "Pick up quantity" in out_check.columns:
+                out_check["Pick up quantity"] = out_check["Pick up quantity"].apply(clean_number)
+            else:
+                out_check["Pick up quantity"] = pd.NA
+
+            out_res = (
+                out_check
+                .dropna(subset=["Contract_key", "Pick Up date"])
+                .groupby(["Contract_key", "Pick Up date"], as_index=False)["Pick up quantity"]
+                .sum()
+                .rename(columns={"Pick up quantity": "out_qty_t"})
+            )
+
+            recon = wagi_truth.merge(out_res, on=["Contract_key", "Pick Up date"], how="outer", indicator=True)
+            lost_in_output = recon[recon["_merge"] == "left_only"].copy()
+            qty_mismatch = recon[
+                (recon["_merge"] == "both") &
+                (recon["wagi_qty_t"].fillna(0).round(6) != recon["out_qty_t"].fillna(0).round(6))
+            ].copy()
+
+            # Contract-level totals
+            wagi_contract = (
+                wagi_check.dropna(subset=["Contract_key"])
+                .groupby("Contract_key", as_index=False)["Pick up quantity"]
+                .sum()
+                .rename(columns={"Pick up quantity": "wagi_total_t"})
+            )
+
+            out_contract = (
+                out_check.dropna(subset=["Contract_key"])
+                .groupby("Contract_key", as_index=False)["Pick up quantity"]
+                .sum()
+                .rename(columns={"Pick up quantity": "out_total_t"})
+            )
+
+            contract_recon = wagi_contract.merge(out_contract, on="Contract_key", how="outer", indicator=True)
+            contract_recon["diff_t"] = contract_recon["wagi_total_t"].fillna(0) - contract_recon["out_total_t"].fillna(0)
+
+            # Make diagnostics more readable (original contract text)
+            key_to_contract = wagi_check.dropna(subset=["Contract_key"]).groupby("Contract_key")["Contract"].first()
+            for df_dbg in (lost_in_output, qty_mismatch, contract_recon):
+                if "Contract" not in df_dbg.columns:
+                    df_dbg["Contract"] = df_dbg["Contract_key"].map(key_to_contract)
 
     # ----------------- FIX: duplicates across seasons -----------------
     # For duplicated contracts in SP: Goods sold should be SUM, Season should be Season1/Season2
@@ -655,13 +717,9 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
     # ---- Tonnes only once per Contract + Delivery month (so pivots work cleanly) ----
     if "Contract" in out.columns and "Delivery month" in out.columns:
         out = out.sort_values(["Contract", "Delivery month", "Pick Up date"], na_position="last").reset_index(drop=True)
-
-        # ensure numeric, then blank out duplicates
         out["Tonnes"] = out["Tonnes"].apply(clean_number).fillna(0)
-
         first_tonnes_mask = ~out.duplicated(subset=["Contract", "Delivery month"])
         out.loc[~first_tonnes_mask, "Tonnes"] = "-"
-
 
     # ---- Pickup totals (AFTER wagi merge) ----
     def f64(colname: str) -> pd.Series:
@@ -678,12 +736,25 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
     # Final column order
     out = out[[c for c in FINAL_ORDER if c in out.columns]]
 
-    # ---- WRITE XLSX ----
+    # ---- WRITE XLSX (Output + diagnostics sheets) ----
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         out.to_excel(writer, index=False, sheet_name="Output")
         ws = writer.sheets["Output"]
 
+        # Diagnostics sheets (if any)
+        if not wagi_raw.empty:
+            wagi_raw.to_excel(writer, index=False, sheet_name="Wagi_raw")
+        if not wagi.empty:
+            wagi.to_excel(writer, index=False, sheet_name="Wagi_cleaned")
+        if not lost_in_output.empty:
+            lost_in_output.to_excel(writer, index=False, sheet_name="Diag_lost_in_output")
+        if not qty_mismatch.empty:
+            qty_mismatch.to_excel(writer, index=False, sheet_name="Diag_qty_mismatch")
+        if not contract_recon.empty:
+            contract_recon.to_excel(writer, index=False, sheet_name="Diag_contract_recon")
+
+        # Formatting
         if "Date" in out.columns:
             date_col_idx = out.columns.get_loc("Date") + 1
             for r in range(2, ws.max_row + 1):
@@ -711,8 +782,12 @@ def transform_excel_to_xlsx_bytes(file_obj) -> tuple[bytes, dict]:
         "header_row": header_row,
         "month_cols_detected": [str(k) for k in month_cols.keys()],
         "rows_out": int(out.shape[0]),
+        "diag_lost_in_output_rows": int(lost_in_output.shape[0]) if isinstance(lost_in_output, pd.DataFrame) else 0,
+        "diag_qty_mismatch_rows": int(qty_mismatch.shape[0]) if isinstance(qty_mismatch, pd.DataFrame) else 0,
+        "diag_contract_recon_rows": int(contract_recon.shape[0]) if isinstance(contract_recon, pd.DataFrame) else 0,
     }
-    return xlsx_bytes, meta
+
+    return xlsx_bytes, meta, lost_in_output, qty_mismatch, contract_recon, wagi
 
 
 # ---------------- STREAMLIT UI ----------------
@@ -721,7 +796,7 @@ st.title("SP → Pivotable data converter (XLSX output)")
 uploaded = st.file_uploader("Upload SP file (.xlsx/.xlsm/.xls)", type=["xlsx", "xlsm", "xls"])
 if uploaded:
     try:
-        xlsx_bytes, meta = transform_excel_to_xlsx_bytes(uploaded)
+        xlsx_bytes, meta, lost_in_output, qty_mismatch, contract_recon, wagi_cleaned = transform_excel_to_xlsx_bytes(uploaded)
 
         st.success(f"Done. Output rows: {meta['rows_out']}")
         st.caption(f"Header row used: {meta['header_row']}")
@@ -729,6 +804,26 @@ if uploaded:
             f"Month columns detected: {', '.join(meta['month_cols_detected'][:10])}"
             + (" ..." if len(meta['month_cols_detected']) > 10 else "")
         )
+
+        st.subheader("Wagi → Output diagnostics")
+        st.write(f"Lost in Output (exists in Wagi only, by Contract+Pick Up date): {meta['diag_lost_in_output_rows']}")
+        st.write(f"Qty mismatches (same Contract+Pick Up date, different qty): {meta['diag_qty_mismatch_rows']}")
+
+        if isinstance(lost_in_output, pd.DataFrame) and not lost_in_output.empty:
+            st.markdown("**Lost in Output**")
+            st.dataframe(lost_in_output)
+
+        if isinstance(qty_mismatch, pd.DataFrame) and not qty_mismatch.empty:
+            st.markdown("**Quantity mismatches**")
+            st.dataframe(qty_mismatch)
+
+        if isinstance(contract_recon, pd.DataFrame) and not contract_recon.empty:
+            st.markdown("**Contract-level totals (Wagi vs Output)**")
+            # show only diffs by default
+            diffs = contract_recon[
+                (contract_recon["_merge"] != "both") | (contract_recon["diff_t"].abs() > 1e-6)
+            ].copy()
+            st.dataframe(diffs if not diffs.empty else contract_recon)
 
         output_name = Path(uploaded.name).stem + "_output.xlsx"
 
@@ -741,3 +836,4 @@ if uploaded:
 
     except Exception as e:
         st.error(str(e))
+
