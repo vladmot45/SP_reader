@@ -824,6 +824,30 @@ if uploaded:
                 (contract_recon["_merge"] != "both") | (contract_recon["diff_t"].abs() > 1e-6)
             ].copy()
             st.dataframe(diffs if not diffs.empty else contract_recon)
+        st.subheader("🔎 Missing contracts – source Wagi rows")
+
+        missing = contract_recon[contract_recon["_merge"] == "left_only"]
+
+        if missing.empty:
+            st.info("No missing contracts")
+        else:
+            for _, r in missing.iterrows():
+                key = r["Contract_key"]
+
+                st.markdown(f"**Contract_key:** `{key}`")
+                st.markdown(f"**Missing total (t):** {r['diff_t']}")
+
+                rows = wagi_cleaned[wagi_cleaned["Contract_key"] == key]
+
+                if rows.empty:
+                    st.warning("No Wagi rows found for this Contract_key")
+                else:
+                    st.dataframe(
+                        rows.sort_values("Pick Up date")
+                    )
+
+
+
 
         output_name = Path(uploaded.name).stem + "_output.xlsx"
 
